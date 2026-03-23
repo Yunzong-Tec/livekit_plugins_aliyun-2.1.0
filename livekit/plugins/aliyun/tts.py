@@ -272,11 +272,17 @@ class SynthesizeStream(tts.SynthesizeStream):
                         await asyncio.wait_for(asyncio.gather(*tasks), timeout=60.0)
                     except asyncio.TimeoutError:
                         logger.error(f"tts synthesis timeout for sentence: {sentence}")
-                        # 强制关闭可能处于僵死状态的连接
                         if not ws.closed:
                             await ws.close()
+                    except asyncio.CancelledError:
+                        logger.warning(f"tts synthesis cancelled (user interrupted), closing connection to prevent dirty state.")
+                        if not ws.closed:
+                            await ws.close()
+                        raise
                     except Exception as e:
                         logger.error(f"tts synthesis failed: {e}")
+                        if not ws.closed:
+                            await ws.close()
                     finally:
                         emitter.end_segment()
                         logger.info("tts end", extra={"sentence": sentence})
