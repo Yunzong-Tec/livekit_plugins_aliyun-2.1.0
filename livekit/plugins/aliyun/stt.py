@@ -238,11 +238,24 @@ class SpeechStream(stt.SpeechStream):
         async def recv_task(ws: aiohttp.ClientWebSocketResponse):
             nonlocal closing_ws
             while True:
-                msg = await ws.receive()
+                try:
+                    # 增加接收超时，防止底层 websocket 假死导致进程被看门狗杀掉 (10分钟超时防止正常静默被切断)
+                    msg = await asyncio.wait_for(ws.receive(), timeout=600.0)
+                except asyncio.TimeoutError:
+                    if closing_ws:
+                        return
+                    logger.warning("stt websocket receive timeout, forcing reconnect")
+                    raise APIStatusError(message="stt connection timeout")
+                except Exception as e:
+                    if closing_ws:
+                        return
+                    raise APIStatusError(message=f"stt connection error: {e}")
+
                 if msg.type in (
                     aiohttp.WSMsgType.CLOSED,
                     aiohttp.WSMsgType.CLOSE,
                     aiohttp.WSMsgType.CLOSING,
+                    aiohttp.WSMsgType.ERROR,
                 ):
                     if closing_ws:  # close is expected, see SpeechStream.aclose
                         return
