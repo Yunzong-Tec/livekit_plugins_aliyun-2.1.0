@@ -295,6 +295,12 @@ class SynthesizeStream(tts.SynthesizeStream):
                         try:
                             # 增加整体超时控制，防止任何意外导致的死锁
                             await asyncio.wait_for(asyncio.gather(*tasks), timeout=60.0)
+                            
+                            # 如果子任务内部遇到错误通过 break 退出，而没有抛出异常，
+                            # wait_for/gather 会认为任务已正常完成，从而使得连接在 ws.closed=True 的状态下被连接池回收。
+                            # 必须在这里主动检测闭合状态并抛出异常，触发 ConnectionPool 回收该死连接。
+                            if ws.closed:
+                                raise Exception("WebSocket was closed unexpectedly during synthesis tasks")
                         except asyncio.TimeoutError as e:
                             logger.error(f"tts synthesis timeout for sentence: {sentence}")
                             if not ws.closed:
