@@ -11,7 +11,6 @@ from osc_data.text_stream import TextStreamSentencizer
 
 from .log import logger
 
-
 STREAM_EOS = "EOS"
 
 
@@ -19,17 +18,11 @@ STREAM_EOS = "EOS"
 class TTSOptions:
     api_key: str
     model: str
-    # 语速，取值范围：0.5~2。
     rate: float
-    # 音色
     voice: str
-    # 合成音频的语速，取值范围：0.5~2。
     speech_rate: int
-    # 合成音频的音量，取值范围：0~100。
     volume: int
-    # 采样率，取值范围：8000, 16000, 22050, 24000, 44100, 48000
     sample_rate: int
-    # 音调，取值范围：0.5~2。
     pitch: float = 1.0
 
     def get_ws_url(self) -> str:
@@ -96,18 +89,18 @@ class TTSOptions:
 
 class TTS(tts.TTS):
     def __init__(
-        self,
-        *,
-        api_key: Optional[str] = None,
-        sample_rate: int = 24000,
-        voice: str = "longcheng",
-        model: str = "cosyvoice-v2",
-        speech_rate: int = 1,
-        volume: int = 100,
-        rate: float = 1.0,
-        pitch: float = 1.0,
-        http_session: aiohttp.ClientSession | None = None,
-        max_session_duration: float = 600,
+            self,
+            *,
+            api_key: Optional[str] = None,
+            sample_rate: int = 24000,
+            voice: str = "longcheng",
+            model: str = "cosyvoice-v2",
+            speech_rate: int = 1,
+            volume: int = 100,
+            rate: float = 1.0,
+            pitch: float = 1.0,
+            http_session: aiohttp.ClientSession | None = None,
+            max_session_duration: float = 600,
     ) -> None:
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=True),
@@ -147,7 +140,7 @@ class TTS(tts.TTS):
         headers = self._opts.get_ws_header()
         return await asyncio.wait_for(
             session.ws_connect(
-                url, 
+                url,
                 headers=headers,
                 autoping=True,
                 heartbeat=15.0
@@ -159,24 +152,24 @@ class TTS(tts.TTS):
         await ws.close()
 
     def synthesize(
-        self,
-        text: str,
+            self,
+            text: str,
     ) -> AsyncIterable[tts.SynthesizedAudio]:
         raise NotImplementedError
 
     def stream(
-        self, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
+            self, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
     ) -> "SynthesizeStream":
         return SynthesizeStream(tts=self, opts=self._opts, conn_options=conn_options)
 
 
 class SynthesizeStream(tts.SynthesizeStream):
     def __init__(
-        self,
-        *,
-        tts: TTS,
-        opts: TTSOptions,
-        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+            self,
+            *,
+            tts: TTS,
+            opts: TTSOptions,
+            conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ):
         super().__init__(tts=tts, conn_options=conn_options)
         self._opts = opts
@@ -204,13 +197,13 @@ class SynthesizeStream(tts.SynthesizeStream):
                 logger.error(f"Error while sending tts task: {e}")
                 if not ws.closed:
                     await ws.close()
+                raise e
 
         async def _recv_task(ws: aiohttp.ClientWebSocketResponse):
             is_first_response = True
             start_time = time.perf_counter()
             while True:
                 try:
-                    # 增加超时限制，防止阿里云服务挂起导致卡死进程
                     msg = await asyncio.wait_for(ws.receive(), timeout=15.0)
                 except asyncio.TimeoutError:
                     logger.error("tts task timeout: Aliyun server did not respond in 15 seconds")
@@ -250,7 +243,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                                     if not ws.closed:
                                         await ws.close()
                                     raise Exception(f"TTS task failed: {msg_json}")
-                    except Exception as e:
+                    except json.JSONDecodeError as e:
                         logger.error(f"Failed to parse json msg: {e}")
                         if not ws.closed:
                             await ws.close()
@@ -260,7 +253,7 @@ class SynthesizeStream(tts.SynthesizeStream):
         is_first_sentence = True
         start_time = time.perf_counter()
         emitter.start_segment(segment_id=utils.shortuuid())
-        
+
         try:
             async for token in self._input_ch:
                 if isinstance(token, self._FlushSentinel):
@@ -268,7 +261,6 @@ class SynthesizeStream(tts.SynthesizeStream):
                 else:
                     sentences = splitter.push(text=token)
                 for sentence in sentences:
-                    # 过滤掉仅包含空格或标点符号的无效文本，防止触发 Aliyun TTS InvalidParameter 报错
                     cleaned_sentence = "".join(char for char in sentence if char.isalnum())
                     if not cleaned_sentence:
                         continue
@@ -280,44 +272,57 @@ class SynthesizeStream(tts.SynthesizeStream):
                         )
                         is_first_sentence = False
                     logger.info("tts start", extra={"sentence": sentence})
-                    
-                    async with self._tts._pool.connection(
-                        timeout=self._conn_options.timeout
-                    ) as ws:
-                        # 检查连接是否有效，如果已关闭则抛出异常触发连接池重建
-                        if ws.closed:
-                            logger.warning(f"WebSocket connection is closed, will reconnect for sentence: {sentence[:30]}...")
-                            raise Exception("WebSocket connection was closed, triggering reconnection")
-                        tasks = [
-                            asyncio.create_task(_send_task(sentence=sentence, ws=ws)),
-                            asyncio.create_task(_recv_task(ws=ws)),
-                        ]
+
+                    for attempt in range(2):  # Try up to 2 times per sentence
                         try:
-                            # 增加整体超时控制，防止任何意外导致的死锁
-                            await asyncio.wait_for(asyncio.gather(*tasks), timeout=60.0)
-                            
-                            # 如果子任务内部遇到错误通过 break 退出，而没有抛出异常，
-                            # wait_for/gather 会认为任务已正常完成，从而使得连接在 ws.closed=True 的状态下被连接池回收。
-                            # 必须在这里主动检测闭合状态并抛出异常，触发 ConnectionPool 回收该死连接。
-                            if ws.closed:
-                                raise Exception("WebSocket was closed unexpectedly during synthesis tasks")
-                        except asyncio.TimeoutError as e:
-                            logger.error(f"tts synthesis timeout for sentence: {sentence}")
-                            if not ws.closed:
-                                await ws.close()
-                            raise e
+                            async with self._tts._pool.connection(
+                                    timeout=self._conn_options.timeout
+                            ) as ws:
+                                if ws.closed:
+                                    logger.warning(
+                                        f"WebSocket connection is closed, triggering reconnection for sentence: {sentence[:30]}...")
+                                    raise Exception("WebSocket connection was closed")
+
+                                tasks = [
+                                    asyncio.create_task(_send_task(sentence=sentence, ws=ws)),
+                                    asyncio.create_task(_recv_task(ws=ws)),
+                                ]
+                                try:
+                                    await asyncio.wait_for(asyncio.gather(*tasks), timeout=60.0)
+                                    if ws.closed:
+                                        raise Exception("WebSocket was closed unexpectedly during synthesis tasks")
+                                except asyncio.TimeoutError as e:
+                                    logger.error(f"tts synthesis timeout for sentence: {sentence}")
+                                    if not ws.closed:
+                                        await ws.close()
+                                    raise
+                                except asyncio.CancelledError:
+                                    logger.warning(f"tts synthesis cancelled (user interrupted), closing connection.")
+                                    if not ws.closed:
+                                        await ws.close()
+                                    raise
+                                except Exception as e:
+                                    logger.error(f"tts synthesis failed: {e}")
+                                    if not ws.closed:
+                                        await ws.close()
+                                    raise
+                                finally:
+                                    await utils.aio.gracefully_cancel(*tasks)
+
+                            # If we made it here, synthesis succeeded!
+                            logger.info("tts end", extra={"sentence": sentence})
+                            break  # Exit the retry loop for this sentence
+
                         except asyncio.CancelledError:
-                            logger.warning(f"tts synthesis cancelled (user interrupted), closing connection to prevent dirty state.")
-                            if not ws.closed:
-                                await ws.close()
+                            # User interrupted, do not retry
                             raise
                         except Exception as e:
-                            logger.error(f"tts synthesis failed: {e}")
-                            if not ws.closed:
-                                await ws.close()
-                            raise e
-                        finally:
-                            logger.info("tts end", extra={"sentence": sentence})
-                            await utils.aio.gracefully_cancel(*tasks)
+                            logger.error(f"tts error on attempt {attempt + 1} for sentence: {sentence[:30]}... ({e})")
+                            if attempt == 1:
+                                logger.error(f"Failed to synthesize sentence after 2 attempts, skipping: {sentence}")
+                                # We deliberately DON'T raise here, so we just skip the broken sentence
+                                # and continue to the next one, keeping the agent alive.
+                            else:
+                                await asyncio.sleep(0.5)  # small delay before retry
         finally:
             emitter.end_segment()
