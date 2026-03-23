@@ -197,7 +197,10 @@ class SpeechStream(stt.SpeechStream):
     async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
         ws = await asyncio.wait_for(
             self._session.ws_connect(
-                self._opts.get_ws_url(), headers=self._opts.get_header()
+                self._opts.get_ws_url(), 
+                headers=self._opts.get_header(),
+                autoping=True,
+                heartbeat=15.0
             ),
             self._conn_options.timeout,
         )
@@ -206,10 +209,9 @@ class SpeechStream(stt.SpeechStream):
 
     async def _run(self) -> None:
         closing_ws = False
-        task_id = utils.shortuuid()
 
         @utils.log_exceptions(logger=logger)
-        async def send_task(ws: aiohttp.ClientWebSocketResponse):
+        async def send_task(ws: aiohttp.ClientWebSocketResponse, task_id: str):
             nonlocal closing_ws
             samples_100ms = self._opts.sample_rate // 10
             audio_bstream = utils.audio.AudioByteStream(
@@ -272,15 +274,16 @@ class SpeechStream(stt.SpeechStream):
 
         while True:
             try:
+                task_id = utils.shortuuid()
                 ws = await self._connect_ws()
                 await ws.send_json(self._opts.get_run_task_params(task_id=task_id))
                 tasks = [
-                    asyncio.create_task(send_task(ws)),
+                    asyncio.create_task(send_task(ws, task_id)),
                     asyncio.create_task(recv_task(ws)),
                 ]
                 wait_reconnect_task = asyncio.create_task(self._reconnect_event.wait())
                 try:
-                    done, _ = await asyncio.wait(
+                    done, pending = await asyncio.wait(
                         [asyncio.gather(*tasks), wait_reconnect_task],
                         return_when=asyncio.FIRST_COMPLETED,
                     )  # type: ignore
@@ -296,9 +299,17 @@ class SpeechStream(stt.SpeechStream):
                     self._reconnect_event.clear()
                 finally:
                     await utils.aio.gracefully_cancel(*tasks, wait_reconnect_task)
+            except Exception as e:
+                if closing_ws:
+                    break
+                logger.warning(f"stt connection error, reconnecting: {e}")
+                await asyncio.sleep(1.0)
             finally:
                 if ws is not None:
-                    await ws.close()
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
 
     def _process_stream_event(self, data: dict) -> None:
         event_type = data["header"]["event"]

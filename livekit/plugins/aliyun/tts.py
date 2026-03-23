@@ -146,7 +146,12 @@ class TTS(tts.TTS):
         url = self._opts.get_ws_url()
         headers = self._opts.get_ws_header()
         return await asyncio.wait_for(
-            session.ws_connect(url, headers=headers),
+            session.ws_connect(
+                url, 
+                headers=headers,
+                autoping=True,
+                heartbeat=15.0
+            ),
             timeout=timeout,
         )
 
@@ -244,47 +249,52 @@ class SynthesizeStream(tts.SynthesizeStream):
         splitter = TextStreamSentencizer(remove_emoji=True)
         is_first_sentence = True
         start_time = time.perf_counter()
-        async for token in self._input_ch:
-            if isinstance(token, self._FlushSentinel):
-                sentences = splitter.flush()
-            else:
-                sentences = splitter.push(text=token)
-            for sentence in sentences:
-                if is_first_sentence:
-                    first_sentence_spend = time.perf_counter() - start_time
-                    logger.info(
-                        "llm first sentence",
-                        extra={"spent": str(first_sentence_spend)},
-                    )
-                    is_first_sentence = False
-                logger.info("tts start", extra={"sentence": sentence})
-                emitter.start_segment(segment_id=utils.shortuuid())
-                async with self._tts._pool.connection(
-                    timeout=self._conn_options.timeout
-                ) as ws:
-                    assert not ws.closed, "WebSocket connection is closed"
-                    tasks = [
-                        asyncio.create_task(_send_task(sentence=sentence, ws=ws)),
-                        asyncio.create_task(_recv_task(ws=ws)),
-                    ]
-                    try:
-                        # 增加整体超时控制，防止任何意外导致的死锁
-                        await asyncio.wait_for(asyncio.gather(*tasks), timeout=60.0)
-                    except asyncio.TimeoutError:
-                        logger.error(f"tts synthesis timeout for sentence: {sentence}")
-                        if not ws.closed:
-                            await ws.close()
-                    except asyncio.CancelledError:
-                        logger.warning(f"tts synthesis cancelled (user interrupted), closing connection to prevent dirty state.")
-                        if not ws.closed:
-                            await ws.close()
-                        raise
-                    except Exception as e:
-                        logger.error(f"tts synthesis failed: {e}")
-                        if not ws.closed:
-                            await ws.close()
-                    finally:
-                        emitter.end_segment()
-                        logger.info("tts end", extra={"sentence": sentence})
-                        self._pushed_text = self._pushed_text.replace(sentence, "")
-                        await utils.aio.gracefully_cancel(*tasks)
+        emitter.start_segment(segment_id=utils.shortuuid())
+        
+        try:
+            async for token in self._input_ch:
+                if isinstance(token, self._FlushSentinel):
+                    sentences = splitter.flush()
+                else:
+                    sentences = splitter.push(text=token)
+                for sentence in sentences:
+                    if not sentence.strip():
+                        continue
+                    if is_first_sentence:
+                        first_sentence_spend = time.perf_counter() - start_time
+                        logger.info(
+                            "llm first sentence",
+                            extra={"spent": str(first_sentence_spend)},
+                        )
+                        is_first_sentence = False
+                    logger.info("tts start", extra={"sentence": sentence})
+                    
+                    async with self._tts._pool.connection(
+                        timeout=self._conn_options.timeout
+                    ) as ws:
+                        assert not ws.closed, "WebSocket connection is closed"
+                        tasks = [
+                            asyncio.create_task(_send_task(sentence=sentence, ws=ws)),
+                            asyncio.create_task(_recv_task(ws=ws)),
+                        ]
+                        try:
+                            # 增加整体超时控制，防止任何意外导致的死锁
+                            await asyncio.wait_for(asyncio.gather(*tasks), timeout=60.0)
+                        except asyncio.TimeoutError:
+                            logger.error(f"tts synthesis timeout for sentence: {sentence}")
+                            if not ws.closed:
+                                await ws.close()
+                        except asyncio.CancelledError:
+                            logger.warning(f"tts synthesis cancelled (user interrupted), closing connection to prevent dirty state.")
+                            if not ws.closed:
+                                await ws.close()
+                            raise
+                        except Exception as e:
+                            logger.error(f"tts synthesis failed: {e}")
+                            if not ws.closed:
+                                await ws.close()
+                        finally:
+                            logger.info("tts end", extra={"sentence": sentence})
+                            await utils.aio.gracefully_cancel(*tasks)
+        finally:
+            emitter.end_segment()
