@@ -185,6 +185,9 @@ class SynthesizeStream(tts.SynthesizeStream):
             frame_size_ms=200,
         )
 
+        # 🔴 [修复点] 必须在 push 之前调用 start_segment
+        emitter.start_segment(segment_id=utils.shortuuid())
+
         try:
             # 1. 整个流只获取一次连接
             async with self._tts._pool.connection(
@@ -244,6 +247,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                                     elapsed = time.perf_counter() - start_time
                                     logger.info("tts first response", extra={"spent": round(elapsed, 4)})
                                     is_first_response = False
+                                # 这里如果之前没调用 start_segment，就会报错 RuntimeError
                                 emitter.push(data=msg.data)
 
                             elif msg.type == aiohttp.WSMsgType.TEXT:
@@ -286,4 +290,5 @@ class SynthesizeStream(tts.SynthesizeStream):
                     await utils.aio.gracefully_cancel(*tasks)
 
         finally:
+            # 🔴 这里对应的 end_segment() 前提是前面已经 start_segment()
             emitter.end_segment()
