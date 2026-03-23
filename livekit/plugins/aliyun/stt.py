@@ -213,6 +213,8 @@ class SpeechStream(stt.SpeechStream):
         @utils.log_exceptions(logger=logger)
         async def send_task(ws: aiohttp.ClientWebSocketResponse, task_id: str):
             nonlocal closing_ws
+
+            # 计算 100ms 音频帧的采样数 (16000Hz 下是 1600 个采样)
             samples_100ms = self._opts.sample_rate // 10
             audio_bstream = utils.audio.AudioByteStream(
                 sample_rate=self._opts.sample_rate,
@@ -221,20 +223,52 @@ class SpeechStream(stt.SpeechStream):
             )
 
             has_ended = False
-            async for data in self._input_ch:
-                frames: list[rtc.AudioFrame] = []
-                if isinstance(data, rtc.AudioFrame):
-                    frames.extend(audio_bstream.write(data.data.tobytes()))
-                elif isinstance(data, self._FlushSentinel):
-                    frames.extend(audio_bstream.flush())
-                    has_ended = True
 
-                for frame in frames:
-                    await ws.send_bytes(frame.data.tobytes())
+            # 【新增】：计算 100ms 静音音频的字节数据 (16kHz, 16bit位深=2字节, 单声道)
+            bytes_per_sample = 2
+            silent_bytes = b'\x00' * (samples_100ms * bytes_per_sample)
 
-                if has_ended:
-                    await ws.send_json(self._opts.get_finish_task_params(task_id))
-                    has_ended = False
+            # 获取音频输入管道的异步迭代器
+            iterator = self._input_ch.__aiter__()
+
+            while True:
+                try:
+                    if closing_ws or ws.closed:
+                        break
+
+                    # 【核心修改】：使用 wait_for 设置 0.1 秒 (100ms) 超时时间
+                    # 如果这 100ms 内用户说话了，就会正常读取到 data；如果没有，则抛出 TimeoutError
+                    data = await asyncio.wait_for(iterator.__anext__(), timeout=0.1)
+
+                    frames: list[rtc.AudioFrame] = []
+                    if isinstance(data, rtc.AudioFrame):
+                        # 将收到的音频数据写入缓冲流，生成固定时长的帧
+                        frames.extend(audio_bstream.write(data.data.tobytes()))
+                    elif isinstance(data, self._FlushSentinel):
+                        # 收到结束信号，清空缓冲流
+                        frames.extend(audio_bstream.flush())
+                        has_ended = True
+
+                    # 发送组装好的真实语音数据
+                    for frame in frames:
+                        await ws.send_bytes(frame.data.tobytes())
+
+                    if has_ended:
+                        await ws.send_json(self._opts.get_finish_task_params(task_id))
+                        has_ended = False
+
+                except asyncio.TimeoutError:
+                    # 【核心修改】：100ms 内没有收到 LiveKit 的音频（说明处于静默期或 VAD 截断）
+                    # 主动向服务端发送提前准备好的静音空白帧，保持心跳与服务端长连接
+                    if not closing_ws and not ws.closed:
+                        await ws.send_bytes(silent_bytes)
+
+                except StopAsyncIteration:
+                    # input_ch 管道被关闭时（通常是 Livekit 断开或者调用了 aclose），退出循环
+                    break
+                except Exception as e:
+                    logger.error(f"stt send_task error: {e}")
+                    break
 
         @utils.log_exceptions(logger=logger)
         async def recv_task(ws: aiohttp.ClientWebSocketResponse):
@@ -259,10 +293,10 @@ class SpeechStream(stt.SpeechStream):
                     raise APIStatusError(message=f"stt connection error: {e}")
 
                 if msg.type in (
-                    aiohttp.WSMsgType.CLOSED,
-                    aiohttp.WSMsgType.CLOSE,
-                    aiohttp.WSMsgType.CLOSING,
-                    aiohttp.WSMsgType.ERROR,
+                        aiohttp.WSMsgType.CLOSED,
+                        aiohttp.WSMsgType.CLOSE,
+                        aiohttp.WSMsgType.CLOSING,
+                        aiohttp.WSMsgType.ERROR,
                 ):
                     if closing_ws:  # close is expected, see SpeechStream.aclose
                         return
@@ -303,6 +337,7 @@ class SpeechStream(stt.SpeechStream):
 
                     self._reconnect_event.clear()
                 finally:
+                    closing_ws = True  # 通知子任务准备退出
                     await utils.aio.gracefully_cancel(*tasks, wait_reconnect_task)
             except Exception as e:
                 if closing_ws:
