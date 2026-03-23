@@ -284,7 +284,10 @@ class SynthesizeStream(tts.SynthesizeStream):
                     async with self._tts._pool.connection(
                         timeout=self._conn_options.timeout
                     ) as ws:
-                        assert not ws.closed, "WebSocket connection is closed"
+                        # 检查连接是否有效，如果已关闭则跳过本次合成
+                        if ws.closed:
+                            logger.warning(f"WebSocket connection is closed, skipping sentence: {sentence[:30]}...")
+                            continue
                         tasks = [
                             asyncio.create_task(_send_task(sentence=sentence, ws=ws)),
                             asyncio.create_task(_recv_task(ws=ws)),
