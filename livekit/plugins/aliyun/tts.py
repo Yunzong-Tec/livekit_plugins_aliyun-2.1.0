@@ -216,16 +216,16 @@ class SynthesizeStream(tts.SynthesizeStream):
                     logger.error("tts task timeout: Aliyun server did not respond in 15 seconds")
                     if not ws.closed:
                         await ws.close()
-                    break
+                    raise Exception("TTS task timeout: Aliyun server did not respond in 15 seconds")
                 except Exception as e:
                     logger.warning(f"Error while receiving bytes: {e}")
                     if not ws.closed:
                         await ws.close()
-                    break
+                    raise
 
                 if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSING):
                     logger.warning(f"WebSocket closed unexpectedly with type: {msg.type}")
-                    break
+                    raise Exception(f"WebSocket closed unexpectedly with type: {msg.type}")
 
                 if msg.type == aiohttp.WSMsgType.BINARY:
                     if is_first_response:
@@ -243,18 +243,18 @@ class SynthesizeStream(tts.SynthesizeStream):
                             header = msg_json["header"]
                             if "event" in header:
                                 event = header["event"]
-                                if event == "task-finished":
-                                    break
-                                if event == "task-failed":
-                                    logger.error(f"tts task failed: {msg_json}")
-                                    if not ws.closed:
-                                        await ws.close()
-                                    break
-                    except Exception as e:
-                        logger.error(f"Failed to parse json msg: {e}")
-                        if not ws.closed:
-                            await ws.close()
-                        break
+if event == "task-finished":
+                                        break
+                                    if event == "task-failed":
+                                        logger.error(f"tts task failed: {msg_json}")
+                                        if not ws.closed:
+                                            await ws.close()
+                                        raise Exception(f"TTS task failed: {msg_json}")
+                        except Exception as e:
+                            logger.error(f"Failed to parse json msg: {e}")
+                            if not ws.closed:
+                                await ws.close()
+                            raise
 
         splitter = TextStreamSentencizer(remove_emoji=True)
         is_first_sentence = True
@@ -284,10 +284,10 @@ class SynthesizeStream(tts.SynthesizeStream):
                     async with self._tts._pool.connection(
                         timeout=self._conn_options.timeout
                     ) as ws:
-                        # 检查连接是否有效，如果已关闭则跳过本次合成
+                        # 检查连接是否有效，如果已关闭则抛出异常触发连接池重建
                         if ws.closed:
-                            logger.warning(f"WebSocket connection is closed, skipping sentence: {sentence[:30]}...")
-                            continue
+                            logger.warning(f"WebSocket connection is closed, will reconnect for sentence: {sentence[:30]}...")
+                            raise Exception("WebSocket connection was closed, triggering reconnection")
                         tasks = [
                             asyncio.create_task(_send_task(sentence=sentence, ws=ws)),
                             asyncio.create_task(_recv_task(ws=ws)),
