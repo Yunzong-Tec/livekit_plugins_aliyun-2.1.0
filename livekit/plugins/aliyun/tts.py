@@ -243,18 +243,18 @@ class SynthesizeStream(tts.SynthesizeStream):
                             header = msg_json["header"]
                             if "event" in header:
                                 event = header["event"]
-if event == "task-finished":
-                                        break
-                                    if event == "task-failed":
-                                        logger.error(f"tts task failed: {msg_json}")
-                                        if not ws.closed:
-                                            await ws.close()
-                                        raise Exception(f"TTS task failed: {msg_json}")
-                        except Exception as e:
-                            logger.error(f"Failed to parse json msg: {e}")
-                            if not ws.closed:
-                                await ws.close()
-                            raise
+                                if event == "task-finished":
+                                    break
+                                if event == "task-failed":
+                                    logger.error(f"tts task failed: {msg_json}")
+                                    if not ws.closed:
+                                        await ws.close()
+                                    raise Exception(f"TTS task failed: {msg_json}")
+                    except Exception as e:
+                        logger.error(f"Failed to parse json msg: {e}")
+                        if not ws.closed:
+                            await ws.close()
+                        raise
 
         splitter = TextStreamSentencizer(remove_emoji=True)
         is_first_sentence = True
