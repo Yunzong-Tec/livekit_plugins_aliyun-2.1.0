@@ -247,10 +247,14 @@ class SpeechStream(stt.SpeechStream):
                     if closing_ws:
                         return
                     logger.warning("stt websocket receive timeout, forcing reconnect")
+                    if not ws.closed:
+                        await ws.close()
                     raise APIStatusError(message="stt connection timeout")
                 except Exception as e:
                     if closing_ws:
                         return
+                    if not ws.closed:
+                        await ws.close()
                     raise APIStatusError(message=f"stt connection error: {e}")
 
                 if msg.type in (

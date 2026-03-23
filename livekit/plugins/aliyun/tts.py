@@ -202,6 +202,8 @@ class SynthesizeStream(tts.SynthesizeStream):
                 await ws.send_json(finish_task_params)
             except Exception as e:
                 logger.error(f"Error while sending tts task: {e}")
+                if not ws.closed:
+                    await ws.close()
 
         async def _recv_task(ws: aiohttp.ClientWebSocketResponse):
             is_first_response = True
@@ -212,9 +214,13 @@ class SynthesizeStream(tts.SynthesizeStream):
                     msg = await asyncio.wait_for(ws.receive(), timeout=15.0)
                 except asyncio.TimeoutError:
                     logger.error("tts task timeout: Aliyun server did not respond in 15 seconds")
+                    if not ws.closed:
+                        await ws.close()
                     break
                 except Exception as e:
                     logger.warning(f"Error while receiving bytes: {e}")
+                    if not ws.closed:
+                        await ws.close()
                     break
 
                 if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSING):
@@ -241,9 +247,13 @@ class SynthesizeStream(tts.SynthesizeStream):
                                     break
                                 if event == "task-failed":
                                     logger.error(f"tts task failed: {msg_json}")
+                                    if not ws.closed:
+                                        await ws.close()
                                     break
                     except Exception as e:
                         logger.error(f"Failed to parse json msg: {e}")
+                        if not ws.closed:
+                            await ws.close()
                         break
 
         splitter = TextStreamSentencizer(remove_emoji=True)
