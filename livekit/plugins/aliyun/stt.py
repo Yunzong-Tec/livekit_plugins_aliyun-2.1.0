@@ -253,6 +253,7 @@ class SpeechStream(stt.SpeechStream):
                 except Exception as e:
                     if closing_ws:
                         return
+                    logger.warning(f"stt connection error: {e}")
                     if not ws.closed:
                         await ws.close()
                     raise APIStatusError(message=f"stt connection error: {e}")

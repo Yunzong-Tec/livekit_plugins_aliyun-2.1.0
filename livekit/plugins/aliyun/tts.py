@@ -268,7 +268,9 @@ class SynthesizeStream(tts.SynthesizeStream):
                 else:
                     sentences = splitter.push(text=token)
                 for sentence in sentences:
-                    if not sentence.strip():
+                    # 过滤掉仅包含空格或标点符号的无效文本，防止触发 Aliyun TTS InvalidParameter 报错
+                    cleaned_sentence = "".join(char for char in sentence if char.isalnum())
+                    if not cleaned_sentence:
                         continue
                     if is_first_sentence:
                         first_sentence_spend = time.perf_counter() - start_time
