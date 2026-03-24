@@ -174,6 +174,24 @@ class SynthesizeStream(tts.SynthesizeStream):
         super().__init__(tts=tts, conn_options=conn_options)
         self._opts = opts
 
+    async def _acquire_ws(self) -> aiohttp.ClientWebSocketResponse:
+        last_error = None
+        for attempt in range(2):
+            ws = await self._tts._pool.get(timeout=self._conn_options.timeout)
+            if not ws.closed:
+                if attempt > 0:
+                    logger.warning("recovered from stale pooled tts websocket")
+                return ws
+
+            last_error = RuntimeError("WebSocket connection was already closed")
+            logger.warning(
+                "discarding stale pooled tts websocket",
+                extra={"attempt": attempt + 1},
+            )
+            self._tts._pool.remove(ws)
+
+        raise last_error or RuntimeError("Unable to acquire a valid TTS websocket")
+
     async def _run(self, emitter: tts.AudioEmitter) -> None:
         request_id = utils.shortuuid()
         emitter.initialize(
@@ -188,107 +206,126 @@ class SynthesizeStream(tts.SynthesizeStream):
         # 🔴 [修复点] 必须在 push 之前调用 start_segment
         emitter.start_segment(segment_id=utils.shortuuid())
 
+        ws: aiohttp.ClientWebSocketResponse | None = None
+        reuse_ws = False
         try:
-            # 1. 整个流只获取一次连接
-            async with self._tts._pool.connection(
-                    timeout=self._conn_options.timeout
-            ) as ws:
-                if ws.closed:
-                    raise Exception("WebSocket connection was closed")
+            # 1. 整个流只获取一次连接；如果池中连接已经被服务端关闭，则丢弃并重连一次
+            ws = await self._acquire_ws()
 
-                # 2. 一次完整的流式会话，只发送一次 run-task
-                run_task_params = self._opts.get_run_task_params()
-                await ws.send_json(run_task_params)
+            # 2. 一次完整的流式会话，只发送一次 run-task
+            run_task_params = self._opts.get_run_task_params()
+            await ws.send_json(run_task_params)
 
-                start_time = time.perf_counter()
+            start_time = time.perf_counter()
+            finish_sent = asyncio.Event()
+            task_finished = asyncio.Event()
 
-                # 发送任务：不断将 LLM 产出的文本发送给阿里云
-                async def _send_task():
-                    splitter = TextStreamSentencizer(remove_emoji=True)
-                    try:
-                        async for token in self._input_ch:
-                            if isinstance(token, self._FlushSentinel):
-                                sentences = splitter.flush()
-                            else:
-                                sentences = splitter.push(text=token)
-
-                            for sentence in sentences:
-                                cleaned_sentence = "".join(char for char in sentence if char.isalnum())
-                                if not cleaned_sentence:
-                                    continue
-
-                                logger.info("tts sending sentence", extra={"sentence": sentence})
-                                # 持续发送文本
-                                await ws.send_json(self._opts.get_continue_task_params(text=sentence))
-
-                        # 文本全部生成完毕，发送 finish-task
-                        logger.info("llm output finished, sending finish-task")
-                        await ws.send_json(self._opts.get_finish_task_params())
-                    except asyncio.CancelledError:
-                        logger.debug("send_task cancelled")
-                        return
-                    except Exception as e:
-                        logger.error(f"Error while sending tts text: {e}")
-                        raise e
-
-                # 接收任务：持续接收阿里云返回的音频片段
-                async def _recv_task():
-                    is_first_response = True
-                    try:
-                        while True:
-                            msg = await asyncio.wait_for(ws.receive(), timeout=15.0)
-
-                            if msg.type in (
-                            aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSING):
-                                raise Exception(f"WebSocket closed unexpectedly: {msg.type}")
-
-                            if msg.type == aiohttp.WSMsgType.BINARY:
-                                if is_first_response:
-                                    elapsed = time.perf_counter() - start_time
-                                    logger.info("tts first response", extra={"spent": round(elapsed, 4)})
-                                    is_first_response = False
-                                # 这里如果之前没调用 start_segment，就会报错 RuntimeError
-                                emitter.push(data=msg.data)
-
-                            elif msg.type == aiohttp.WSMsgType.TEXT:
-                                msg_json = json.loads(msg.data)
-                                header = msg_json.get("header", {})
-                                event = header.get("event")
-
-                                if event == "task-finished":
-                                    logger.info("tts task finished successfully")
-                                    break  # 整个流式任务顺利结束
-                                elif event == "task-failed":
-                                    raise Exception(f"TTS task failed: {msg_json}")
-
-                    except asyncio.TimeoutError:
-                        logger.error("tts receive timeout")
-                        raise Exception("TTS task timeout")
-                    except asyncio.CancelledError:
-                        logger.debug("recv_task cancelled")
-                        return
-                    except Exception as e:
-                        logger.error(f"tts receive error: {e}")
-                        raise e
-
-                # 并发执行收发任务
-                tasks = [
-                    asyncio.create_task(_send_task()),
-                    asyncio.create_task(_recv_task()),
-                ]
-
+            # 发送任务：不断将 LLM 产出的文本发送给阿里云
+            async def _send_task():
+                splitter = TextStreamSentencizer(remove_emoji=True)
                 try:
-                    await asyncio.gather(*tasks)
+                    async for token in self._input_ch:
+                        if isinstance(token, self._FlushSentinel):
+                            sentences = splitter.flush()
+                        else:
+                            sentences = splitter.push(text=token)
+
+                        for sentence in sentences:
+                            cleaned_sentence = "".join(char for char in sentence if char.isalnum())
+                            if not cleaned_sentence:
+                                continue
+
+                            logger.info("tts sending sentence", extra={"sentence": sentence})
+                            await ws.send_json(self._opts.get_continue_task_params(text=sentence))
+
+                    logger.info("llm output finished, sending finish-task")
+                    await ws.send_json(self._opts.get_finish_task_params())
+                    finish_sent.set()
                 except asyncio.CancelledError:
-                    # 3. 处理用户打断 (LiveKit VAD 检测到用户说话)
-                    logger.warning("tts synthesis cancelled (user interrupted), closing connection.")
-                    # 强制关闭 websocket 可以切断阿里云那边的生成，防止继续扣费和产生音频
-                    if not ws.closed:
-                        await ws.close()
-                    raise
-                finally:
-                    await utils.aio.gracefully_cancel(*tasks)
+                    logger.debug("send_task cancelled")
+                    return
+                except Exception as e:
+                    logger.error(f"Error while sending tts text: {e}")
+                    raise e
+
+            # 接收任务：持续接收阿里云返回的音频片段
+            async def _recv_task():
+                is_first_response = True
+                try:
+                    while True:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=15.0)
+
+                        if msg.type == aiohttp.WSMsgType.BINARY:
+                            if is_first_response:
+                                elapsed = time.perf_counter() - start_time
+                                logger.info("tts first response", extra={"spent": round(elapsed, 4)})
+                                is_first_response = False
+                            emitter.push(data=msg.data)
+                            continue
+
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            msg_json = json.loads(msg.data)
+                            header = msg_json.get("header", {})
+                            event = header.get("event")
+
+                            if event == "task-finished":
+                                logger.info("tts task finished successfully")
+                                task_finished.set()
+                                break
+                            if event == "task-failed":
+                                raise Exception(f"TTS task failed: {msg_json}")
+                            continue
+
+                        if msg.type in (
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.CLOSING,
+                        ):
+                            if finish_sent.is_set() or task_finished.is_set() or ws.closed:
+                                logger.info("tts websocket closed after synthesis finished")
+                                break
+                            raise Exception(f"WebSocket closed unexpectedly: {msg.type}")
+
+                        if msg.type == aiohttp.WSMsgType.ERROR:
+                            if finish_sent.is_set() or task_finished.is_set():
+                                logger.info("tts websocket errored after synthesis finished")
+                                break
+                            raise Exception(f"WebSocket error: {ws.exception()}")
+
+                    return
+                except asyncio.TimeoutError:
+                    logger.error("tts receive timeout")
+                    raise Exception("TTS task timeout")
+                except asyncio.CancelledError:
+                    logger.debug("recv_task cancelled")
+                    return
+                except Exception as e:
+                    logger.error(f"tts receive error: {e}")
+                    raise e
+
+            tasks = [
+                asyncio.create_task(_send_task()),
+                asyncio.create_task(_recv_task()),
+            ]
+
+            try:
+                await asyncio.gather(*tasks)
+                reuse_ws = not ws.closed
+            except asyncio.CancelledError:
+                logger.warning("tts synthesis cancelled (user interrupted), closing connection.")
+                if not ws.closed:
+                    await ws.close()
+                raise
+            except Exception:
+                reuse_ws = False
+                raise
+            finally:
+                await utils.aio.gracefully_cancel(*tasks)
 
         finally:
+            if ws is not None:
+                if reuse_ws and not ws.closed:
+                    self._tts._pool.put(ws)
+                else:
+                    self._tts._pool.remove(ws)
             # 🔴 这里对应的 end_segment() 前提是前面已经 start_segment()
             emitter.end_segment()
