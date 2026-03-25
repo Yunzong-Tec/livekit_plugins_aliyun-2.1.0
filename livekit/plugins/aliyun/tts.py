@@ -5,6 +5,7 @@ import time
 import aiohttp
 import asyncio
 import json
+import uuid
 
 from livekit.agents import tts, APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS, utils
 from osc_data.text_stream import TextStreamSentencizer
@@ -34,13 +35,16 @@ class TTSOptions:
             "X-DashScope-DataInspection": "enable",
         }
 
-    def get_run_task_params(self) -> Dict[str, str]:
+    def _task_header(self, action: str, task_id: str) -> Dict[str, str]:
+        return {
+            "action": action,
+            "task_id": task_id,
+            "streaming": "duplex",
+        }
+
+    def get_run_task_params(self, task_id: str) -> Dict[str, object]:
         params = {
-            "header": {
-                "action": "run-task",
-                "task_id": utils.shortuuid(),
-                "streaming": "duplex",
-            },
+            "header": self._task_header("run-task", task_id),
             "payload": {
                 "task_group": "audio",
                 "task": "tts",
@@ -60,13 +64,9 @@ class TTSOptions:
         }
         return params
 
-    def get_continue_task_params(self, text: str) -> Dict[str, str]:
+    def get_continue_task_params(self, task_id: str, text: str) -> Dict[str, object]:
         params = {
-            "header": {
-                "action": "continue-task",
-                "task_id": utils.shortuuid(),
-                "streaming": "duplex",
-            },
+            "header": self._task_header("continue-task", task_id),
             "payload": {
                 "input": {
                     "text": text,
@@ -75,13 +75,9 @@ class TTSOptions:
         }
         return params
 
-    def get_finish_task_params(self) -> Dict[str, str]:
+    def get_finish_task_params(self, task_id: str) -> Dict[str, object]:
         params = {
-            "header": {
-                "action": "finish-task",
-                "task_id": utils.shortuuid(),
-                "streaming": "duplex",
-            },
+            "header": self._task_header("finish-task", task_id),
             "payload": {"input": {}},
         }
         return params
@@ -194,6 +190,7 @@ class SynthesizeStream(tts.SynthesizeStream):
 
     async def _run(self, emitter: tts.AudioEmitter) -> None:
         request_id = utils.shortuuid()
+        task_id = uuid.uuid4().hex
         emitter.initialize(
             request_id=request_id,
             sample_rate=self._opts.sample_rate,
@@ -213,17 +210,42 @@ class SynthesizeStream(tts.SynthesizeStream):
             ws = await self._acquire_ws()
 
             # 2. 一次完整的流式会话，只发送一次 run-task
-            run_task_params = self._opts.get_run_task_params()
+            run_task_params = self._opts.get_run_task_params(task_id=task_id)
+            logger.info(
+                "tts starting task",
+                extra={"task_id": task_id, "model": self._opts.model, "voice": self._opts.voice},
+            )
             await ws.send_json(run_task_params)
 
             start_time = time.perf_counter()
+            task_started = asyncio.Event()
             finish_sent = asyncio.Event()
             task_finished = asyncio.Event()
+            sent_any_text = False
 
             # 发送任务：不断将 LLM 产出的文本发送给阿里云
             async def _send_task():
                 splitter = TextStreamSentencizer(remove_emoji=True)
+
+                async def _send_sentence(sentence: str) -> None:
+                    nonlocal sent_any_text
+
+                    cleaned_sentence = "".join(char for char in sentence if char.isalnum())
+                    if not cleaned_sentence:
+                        return
+
+                    sent_any_text = True
+                    logger.info(
+                        "tts sending sentence",
+                        extra={"task_id": task_id, "sentence": sentence},
+                    )
+                    await ws.send_json(
+                        self._opts.get_continue_task_params(task_id=task_id, text=sentence)
+                    )
+
                 try:
+                    await asyncio.wait_for(task_started.wait(), timeout=10.0)
+
                     async for token in self._input_ch:
                         if isinstance(token, self._FlushSentinel):
                             sentences = splitter.flush()
@@ -231,19 +253,30 @@ class SynthesizeStream(tts.SynthesizeStream):
                             sentences = splitter.push(text=token)
 
                         for sentence in sentences:
-                            cleaned_sentence = "".join(char for char in sentence if char.isalnum())
-                            if not cleaned_sentence:
-                                continue
+                            await _send_sentence(sentence)
 
-                            logger.info("tts sending sentence", extra={"sentence": sentence})
-                            await ws.send_json(self._opts.get_continue_task_params(text=sentence))
+                    for sentence in splitter.flush():
+                        await _send_sentence(sentence)
 
-                    logger.info("llm output finished, sending finish-task")
-                    await ws.send_json(self._opts.get_finish_task_params())
+                    if not sent_any_text:
+                        logger.info(
+                            "tts stream finished without valid text, closing websocket",
+                            extra={"task_id": task_id},
+                        )
+                        finish_sent.set()
+                        if not ws.closed:
+                            await ws.close()
+                        return
+
+                    logger.info("llm output finished, sending finish-task", extra={"task_id": task_id})
+                    await ws.send_json(self._opts.get_finish_task_params(task_id=task_id))
                     finish_sent.set()
                 except asyncio.CancelledError:
                     logger.debug("send_task cancelled")
                     return
+                except asyncio.TimeoutError as e:
+                    logger.error("tts task-started timeout", extra={"task_id": task_id})
+                    raise Exception("TTS task-started timeout") from e
                 except Exception as e:
                     logger.error(f"Error while sending tts text: {e}")
                     raise e
@@ -253,12 +286,15 @@ class SynthesizeStream(tts.SynthesizeStream):
                 is_first_response = True
                 try:
                     while True:
-                        msg = await asyncio.wait_for(ws.receive(), timeout=15.0)
+                        msg = await asyncio.wait_for(ws.receive(), timeout=30.0)
 
                         if msg.type == aiohttp.WSMsgType.BINARY:
                             if is_first_response:
                                 elapsed = time.perf_counter() - start_time
-                                logger.info("tts first response", extra={"spent": round(elapsed, 4)})
+                                logger.info(
+                                    "tts first response",
+                                    extra={"task_id": task_id, "spent": round(elapsed, 4)},
+                                )
                                 is_first_response = False
                             emitter.push(data=msg.data)
                             continue
@@ -267,12 +303,45 @@ class SynthesizeStream(tts.SynthesizeStream):
                             msg_json = json.loads(msg.data)
                             header = msg_json.get("header", {})
                             event = header.get("event")
+                            recv_task_id = header.get("task_id")
+
+                            if recv_task_id and recv_task_id != task_id:
+                                logger.warning(
+                                    "ignoring unexpected tts event task_id",
+                                    extra={
+                                        "expected_task_id": task_id,
+                                        "received_task_id": recv_task_id,
+                                        "event": event,
+                                    },
+                                )
+                                continue
+
+                            if event == "task-started":
+                                logger.info("tts task started", extra={"task_id": task_id})
+                                task_started.set()
+                                continue
+
+                            if event == "result-generated":
+                                continue
 
                             if event == "task-finished":
-                                logger.info("tts task finished successfully")
+                                request_uuid = header.get("attributes", {}).get("request_uuid")
+                                logger.info(
+                                    "tts task finished successfully",
+                                    extra={"task_id": task_id, "request_uuid": request_uuid},
+                                )
                                 task_finished.set()
                                 break
                             if event == "task-failed":
+                                logger.error(
+                                    "tts task failed event received",
+                                    extra={
+                                        "task_id": task_id,
+                                        "error_code": header.get("error_code"),
+                                        "error_message": header.get("error_message"),
+                                        "request_uuid": header.get("attributes", {}).get("request_uuid"),
+                                    },
+                                )
                                 raise Exception(f"TTS task failed: {msg_json}")
                             continue
 
@@ -309,7 +378,7 @@ class SynthesizeStream(tts.SynthesizeStream):
 
             try:
                 await asyncio.gather(*tasks)
-                reuse_ws = not ws.closed
+                reuse_ws = task_finished.is_set() and not ws.closed
             except asyncio.CancelledError:
                 logger.warning("tts synthesis cancelled (user interrupted), closing connection.")
                 if not ws.closed:
