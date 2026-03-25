@@ -222,8 +222,6 @@ class SpeechStream(stt.SpeechStream):
                 samples_per_channel=samples_100ms,
             )
 
-            has_ended = False
-
             # 【新增】：计算 100ms 静音音频的字节数据 (16kHz, 16bit位深=2字节, 单声道)
             bytes_per_sample = 2
             silent_bytes = b'\x00' * (samples_100ms * bytes_per_sample)
@@ -245,17 +243,13 @@ class SpeechStream(stt.SpeechStream):
                         # 将收到的音频数据写入缓冲流，生成固定时长的帧
                         frames.extend(audio_bstream.write(data.data.tobytes()))
                     elif isinstance(data, self._FlushSentinel):
-                        # 收到结束信号，清空缓冲流
+                        # LiveKit flush 仅表示一句话结束，不应直接结束阿里云 task。
+                        # 这里仅把 AudioByteStream 内部尚未对齐的尾帧推出，保持长连接识别任务继续存活。
                         frames.extend(audio_bstream.flush())
-                        has_ended = True
 
                     # 发送组装好的真实语音数据
                     for frame in frames:
                         await ws.send_bytes(frame.data.tobytes())
-
-                    if has_ended:
-                        await ws.send_json(self._opts.get_finish_task_params(task_id))
-                        has_ended = False
 
                 except asyncio.TimeoutError:
                     # 【核心修改】：100ms 内没有收到 LiveKit 的音频（说明处于静默期或 VAD 截断）
@@ -264,7 +258,15 @@ class SpeechStream(stt.SpeechStream):
                         await ws.send_bytes(silent_bytes)
 
                 except StopAsyncIteration:
-                    # input_ch 管道被关闭时（通常是 Livekit 断开或者调用了 aclose），退出循环
+                    # input_ch 管道被关闭时（通常是 Livekit 断开或者调用了 aclose），
+                    # 这里才真正结束阿里云 task，避免每次 utterance flush 都把整条识别任务结束掉。
+                    try:
+                        for frame in audio_bstream.flush():
+                            await ws.send_bytes(frame.data.tobytes())
+                        if not ws.closed:
+                            await ws.send_json(self._opts.get_finish_task_params(task_id))
+                    except Exception as e:
+                        logger.warning(f"stt finish_task on close failed: {e}")
                     break
                 except Exception as e:
                     logger.error(f"stt send_task error: {e}")
