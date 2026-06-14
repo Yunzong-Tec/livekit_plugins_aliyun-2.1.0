@@ -96,7 +96,7 @@ class TTS(tts.TTS):
             rate: float = 1.0,
             pitch: float = 1.0,
             http_session: aiohttp.ClientSession | None = None,
-            max_session_duration: float = 600,
+            max_session_duration: float = 600,  
     ) -> None:
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=True),
@@ -260,12 +260,17 @@ class SynthesizeStream(tts.SynthesizeStream):
 
                     if not sent_any_text:
                         logger.info(
-                            "tts stream finished without valid text, closing websocket",
+                            "tts stream finished without valid text, sending finish-task to close gracefully",
                             extra={"task_id": task_id},
                         )
+                        # 发送 finish-task 让服务端正常关闭，而非直接断开 websocket
+                        # 避免服务端返回 task-failed 错误
+                        try:
+                            if not ws.closed:
+                                await ws.send_json(self._opts.get_finish_task_params(task_id=task_id))
+                        except Exception:
+                            pass
                         finish_sent.set()
-                        if not ws.closed:
-                            await ws.close()
                         return
 
                     logger.info("llm output finished, sending finish-task", extra={"task_id": task_id})
@@ -333,12 +338,26 @@ class SynthesizeStream(tts.SynthesizeStream):
                                 task_finished.set()
                                 break
                             if event == "task-failed":
+                                error_code = header.get("error_code", "")
+                                error_message = header.get("error_message", "")
+                                # InvalidParameter 通常是空文本/无效文本导致，无需抛异常，优雅结束即可
+                                if error_code == "InvalidParameter":
+                                    logger.warning(
+                                        "tts task failed due to invalid/empty text, ending synthesis gracefully",
+                                        extra={
+                                            "task_id": task_id,
+                                            "error_code": error_code,
+                                            "error_message": error_message,
+                                        },
+                                    )
+                                    task_finished.set()
+                                    break
                                 logger.error(
                                     "tts task failed event received",
                                     extra={
                                         "task_id": task_id,
-                                        "error_code": header.get("error_code"),
-                                        "error_message": header.get("error_message"),
+                                        "error_code": error_code,
+                                        "error_message": error_message,
                                         "request_uuid": header.get("attributes", {}).get("request_uuid"),
                                     },
                                 )
