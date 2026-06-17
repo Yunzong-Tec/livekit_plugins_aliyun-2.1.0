@@ -358,8 +358,10 @@ class SpeechStream(stt.SpeechStream):
         if event_type == "result-generated":
             output = data["payload"]["output"]["sentence"]
             is_sentence_end = output["sentence_end"]
-            start_time = output["begin_time"]
-            end_time = output["end_time"]
+            # 兜底：阿里云在 interim（句子未结束）阶段可能返回 None，
+            # 而新版 livekit-agents 会执行 `end_time > 0` 检查，None 会触发 TypeError，故降级为 0
+            start_time = output.get("begin_time") or 0
+            end_time = output.get("end_time") or 0
             text = output["text"]
             if not self._speaking:
                 start_event = stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
@@ -418,8 +420,8 @@ def live_transcription_to_speech_data(
     return [
         stt.SpeechData(
             language=language,
-            start_time=data["begin_time"],
-            end_time=data["end_time"],
+            start_time=data.get("begin_time") or 0,
+            end_time=data.get("end_time") or 0,
             confidence=0.0,
             text=data["text"],
         )
