@@ -193,6 +193,9 @@ class SpeechStream(stt.SpeechStream):
         self._request_id = utils.shortuuid()
         self._reconnect_event = asyncio.Event()
         self._session = http_session
+        # 累计已发送给阿里云的音频时长（秒），作为 SpeechData.start_time/end_time
+        # 的稳定时间源（见 _process_stream_event 中的说明）
+        self._audio_elapsed_s: float = 0.0
 
     async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
         ws = await asyncio.wait_for(
@@ -250,12 +253,14 @@ class SpeechStream(stt.SpeechStream):
                     # 发送组装好的真实语音数据
                     for frame in frames:
                         await ws.send_bytes(frame.data.tobytes())
+                        self._audio_elapsed_s += frame.samples_per_channel / frame.sample_rate
 
                 except asyncio.TimeoutError:
                     # 【核心修改】：100ms 内没有收到 LiveKit 的音频（说明处于静默期或 VAD 截断）
                     # 主动向服务端发送提前准备好的静音空白帧，保持心跳与服务端长连接
                     if not closing_ws and not ws.closed:
                         await ws.send_bytes(silent_bytes)
+                        self._audio_elapsed_s += samples_100ms / self._opts.sample_rate
 
                 except StopAsyncIteration:
                     # input_ch 管道被关闭时（通常是 Livekit 断开或者调用了 aclose），
@@ -358,10 +363,17 @@ class SpeechStream(stt.SpeechStream):
         if event_type == "result-generated":
             output = data["payload"]["output"]["sentence"]
             is_sentence_end = output["sentence_end"]
-            # 兜底：阿里云在 interim（句子未结束）阶段可能返回 None，
-            # 而新版 livekit-agents 会执行 `end_time > 0` 检查，None 会触发 TypeError，故降级为 0
-            start_time = output.get("begin_time") or 0
-            end_time = output.get("end_time") or 0
+            # ⚠️ 时间戳处理（修复"语音时长/计费爆炸 + 识别失效"问题）：
+            # 阿里云 begin_time/end_time 单位为毫秒，interim 阶段可能为 None，STT 重连后
+            # 还会从 0 重新计数；而新版 livekit-agents 把 SpeechData.start_time/end_time
+            # 当作"相对音频流起点的秒数"，与 _input_started_at(墙钟)相加得到
+            # started/stopped_speaking_at。若传 0/None/毫秒，框架会把说话起点映射到
+            # "音频流起点"(进程已跑十几小时 → 66574s 前)，导致语音时长与计费爆炸、
+            # turn 无法完成、出现 "speech scheduling is paused"。
+            # 这里统一使用累计音频时钟(秒)：它始终 ≈ now - _input_started_at，与框架期望
+            # 严格对齐，且天然免疫 None / 单位 / 重连复位 三类问题。
+            start_time = self._audio_elapsed_s
+            end_time = self._audio_elapsed_s
             text = output["text"]
             if not self._speaking:
                 start_event = stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
